@@ -1,0 +1,124 @@
+"""
+A small Pyomo model that schedules charging/discharging of a grid battery
+over 24 hours of day-ahead electricity prices.
+
+The degradation term here is a simple linearized cycle cost:
+
+    aging_cost_per_MWh = replacement_cost / (2 * cycles_to_EOL * capacity)
+
+The Cycle Depth Stress Function (CDSF) in the LEGO model of TU Graz's IEE
+(Wogrin et al., SoftwareX 2022) does this more rigorously by segmenting
+state of charge into depth ranges and pricing deep cycles superlinearly.
+This project is a very very simple version of the same idea.
+
+Run:  python battery_dispatch.py
+Deps: pyomo, highspy, matplotlib
+"""
+
+import pyomo.environ as pyo
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# Input data
+
+# Day-ahead prices [EUR/MWh]
+PRICES = [
+    42, 38, 35, 33, 32, 36, 55, 74, 88, 76, 65, 58,
+    54, 52, 55, 60, 72, 95, 110, 92, 70, 58, 50, 45,
+]
+
+# Battery parameters 
+CAPACITY_MWH = 10.0        # usable energy capacity
+P_MAX_MW = 5.0             # max charge/discharge power
+ETA_CH = 0.95              # charge efficiency
+ETA_DIS = 0.95             # discharge efficiency
+SOC_START = 0.5            # initial state of charge [fraction]
+REPLACE_COST_EUR = 2_000_000  # cell replacement cost for the full pack
+CYCLES_TO_EOL = 5_000      # full equivalent cycles until end of life
+
+# Linearized aging cost per MWh discharged
+AGING_COST = REPLACE_COST_EUR / (2 * CYCLES_TO_EOL * CAPACITY_MWH)
+
+
+def build_model(aging_cost: float) -> pyo.ConcreteModel:
+    m = pyo.ConcreteModel("battery_dispatch")
+    m.T = pyo.RangeSet(0, len(PRICES) - 1)
+
+    m.charge = pyo.Var(m.T, bounds=(0, P_MAX_MW))      # MW drawn from grid
+    m.discharge = pyo.Var(m.T, bounds=(0, P_MAX_MW))   # MW sold to grid
+    m.soc = pyo.Var(m.T, bounds=(0, CAPACITY_MWH))     # MWh stored
+
+    # SoC balance
+    # from LEGO, eCDSF_SoC included
+    def soc_balance(m, t):
+        prev = SOC_START * CAPACITY_MWH if t == 0 else m.soc[t - 1]
+        return m.soc[t] == prev + ETA_CH * m.charge[t] - m.discharge[t] / ETA_DIS
+
+    m.soc_balance = pyo.Constraint(m.T, rule=soc_balance)
+
+    m.end_soc = pyo.Constraint(
+        expr=m.soc[len(PRICES) - 1] >= SOC_START * CAPACITY_MWH
+    )
+
+    # arbitrage revenue minus energy cost minus aging cost.
+    m.profit = pyo.Objective(
+        expr=sum(
+            PRICES[t] * (m.discharge[t] - m.charge[t])
+            - aging_cost * m.discharge[t]
+            for t in m.T
+        ),
+        sense=pyo.maximize,
+    )
+    return m
+
+
+def solve(m: pyo.ConcreteModel) -> None:
+    solver = pyo.SolverFactory("appsi_highs")
+    result = solver.solve(m)
+    tc = result.solver.termination_condition
+    assert str(tc) in ("optimal", "TerminationCondition.optimal"), tc
+
+
+def report(m: pyo.ConcreteModel, label: str) -> float:
+    dis = sum(pyo.value(m.discharge[t]) for t in m.T)
+    profit = pyo.value(m.profit)
+    print(f"{label:>28}: profit {profit:8.0f} EUR | energy discharged {dis:5.1f} MWh")
+    return profit
+
+
+def plot(m_free: pyo.ConcreteModel, m_aging: pyo.ConcreteModel) -> None:
+    hours = list(range(len(PRICES)))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+
+    ax1.step(hours, PRICES, where="mid", color="tab:gray")
+    ax1.set_ylabel("Price [EUR/MWh]")
+    ax1.set_title("Day-ahead price and optimal battery schedule")
+
+    for m, name, color in [(m_free, "no aging cost", "tab:red"),
+                           (m_aging, "with aging cost", "tab:blue")]:
+        net = [pyo.value(m.discharge[t]) - pyo.value(m.charge[t]) for t in m.T]
+        ax2.step(hours, net, where="mid", label=name, color=color)
+
+    ax2.axhline(0, color="black", linewidth=0.5)
+    ax2.set_ylabel("Net output [MW]")
+    ax2.set_xlabel("Hour")
+    ax2.legend()
+    fig.tight_layout()
+    fig.savefig("dispatch.png", dpi=120)
+    print("Wrote dispatch.png")
+
+
+if __name__ == "__main__":
+    print(f"Linearized aging cost: {AGING_COST:.1f} EUR/MWh discharged\n")
+
+    m_free = build_model(aging_cost=0.0)
+    solve(m_free)
+    report(m_free, "Ignoring degradation")
+
+    m_aging = build_model(aging_cost=AGING_COST)
+    solve(m_aging)
+    report(m_aging, "Pricing degradation")
+
+    plot(m_free, m_aging)
